@@ -10,7 +10,12 @@ apikey.txt
 .env.*
 state.json
 status.json
+state.ini
 .credentials.yaml
 *.pem
 *.key
 *.lock
+# Diagnostic captures written by dsh_pet.ps1 --shot: they show the real balance
+# and a full desktop grab, so they must never be committed.
+_shot*.png
+shot.png

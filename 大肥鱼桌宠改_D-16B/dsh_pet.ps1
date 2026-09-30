@@ -221,6 +221,14 @@ public sealed class SoundPool {
         return sb.ToString();
     }
 
+    // mciSendString reports failure through its RETURN CODE and leaves the reply
+    // buffer empty either way, so testing the buffer for emptiness marks every
+    // failed "open" as a success. Only the return code is a usable signal.
+    static bool SendOk(string cmd) {
+        StringBuilder sb = new StringBuilder(256);
+        return mciSendStringW(cmd, sb, sb.Capacity, IntPtr.Zero) == 0;
+    }
+
     readonly string _path;
     readonly int _slots;
     readonly string[] _alias;
@@ -238,16 +246,16 @@ public sealed class SoundPool {
         _volumePercent = volumePercent;
         _alias = new string[slots]; _open = new bool[slots];
         try {
-            // MCI receives a mangled path when the folder name is not ASCII, so
-            // switch the process working directory to the sound's own folder and
-            // have MCI open the bare file name instead of a full path.
-            try { Directory.SetCurrentDirectory(Path.GetDirectoryName(path)); } catch { }
-            string bare = Path.GetFileName(path);
+            // The ABSOLUTE path is what MCI accepts. It used to cd into the sound's
+            // folder and open the bare file name, on the theory that a non-ASCII
+            // path gets mangled - but a bare name fails outright with "file not
+            // found" no matter what the working directory is, and the full-path
+            // retry below never ran because the success test looked at the reply
+            // buffer instead of the return code. Result: the cue could never play.
             for (int i = 0; i < slots; i++) {
                 _alias[i] = tag + i;
                 Send("close " + _alias[i]);
-                _open[i] = Send("open \"" + bare + "\" type mpegvideo alias " + _alias[i]).Length == 0;
-                if (!_open[i]) _open[i] = Send("open \"" + path + "\" type mpegvideo alias " + _alias[i]).Length == 0;
+                _open[i] = SendOk("open \"" + path + "\" type mpegvideo alias " + _alias[i]);
                 if (_open[i]) Send("setaudio " + _alias[i] + " volume to " + volumePercent * 10);
             }
             if (!_open[0]) { Failed = true; Error = "cannot open " + path; }
@@ -283,7 +291,7 @@ public sealed class SoundPool {
                 // every slot is busy: reopen the first so a burst still overlaps
                 if (attempt == 0) {
                     Send("close " + _alias[0]);
-                    _open[0] = Send("open \"" + _path + "\" type mpegvideo alias " + _alias[0]).Length == 0;
+                    _open[0] = SendOk("open \"" + _path + "\" type mpegvideo alias " + _alias[0]);
                 }
             }
         } catch (Exception ex) {
@@ -494,6 +502,12 @@ public sealed class DshPet : Form {
     readonly string _apiUrl;
     readonly int _pollMs;
     string _apiKey;
+    // Two credential shapes are supported. An sk- API Key talks to
+    // api.deepseek.com with an Authorization: Bearer header. A DSH account grant
+    // (deepseek-account-platform/default) instead carries token + issuer, uses the
+    // x-dsh-auth-token header and answers with a different JSON shape.
+    bool _isAccount;
+    string _token;
     bool _noSave;                // set by the diagnostic entry points
 
     Bitmap _flat, _sprNormal, _sprRed, _canvas;
@@ -685,6 +699,9 @@ public sealed class DshPet : Form {
         SetBounds(vsInit.Left, vsInit.Top, _winW, _winH);
         _apiKey  = Get("DSHPET_KEY", "");
         _apiUrl  = Get("DSHPET_API", "https://api.deepseek.com/user/balance");
+        _isAccount = Get("DSHPET_AUTH", "key") == "account";
+        _token     = Get("DSHPET_TOKEN", "");
+        Log("credentials: " + CredentialSource + ", endpoint=" + _apiUrl);
         _pollMs  = int.Parse(Get("DSHPET_POLL_MS", "2000"));
         _cm      = double.Parse(Get("DSHPET_CM", "8"), CultureInfo.InvariantCulture);
         _soundWanted = Get("DSHPET_SOUND", "1") != "0";
@@ -744,7 +761,7 @@ public sealed class DshPet : Form {
         // of leaving the tablet stuck on "--". Cancelling keeps it offline.
         bool quietRun = Array.IndexOf(args, "--selftest") >= 0 || Array.IndexOf(args, "--shot") >= 0 ||
                         Array.IndexOf(args, "--menushot") >= 0;
-        if (string.IsNullOrEmpty(_apiKey) && !quietRun && !File.Exists(KeyPath)) {
+        if (!HasSecret && !quietRun && !File.Exists(KeyPath)) {
             using (InputDialog d = new InputDialog(S_KEYT, S_KEYP, "", "")) {
                 if (d.ShowDialog(this) == DialogResult.OK) {
                     string k = d.Value;
@@ -782,6 +799,18 @@ public sealed class DshPet : Form {
     static string Get(string n, string f) {
         string v = Environment.GetEnvironmentVariable(n);
         return string.IsNullOrEmpty(v) ? f : v;
+    }
+
+    // The credential a request is actually signed with: the account grant token
+    // in account mode, the sk- API Key otherwise.
+    string Secret { get { return _isAccount ? _token : _apiKey; } }
+    bool HasSecret { get { return !string.IsNullOrEmpty(Secret); } }
+
+    string CredentialSource {
+        get {
+            if (_isAccount) return "DSH account grant";
+            return _apiKey.Length > 0 ? "API key" : "none";
+        }
     }
 
     // Builds one menu entry: a drawn icon plus the label.
@@ -1238,6 +1267,7 @@ public sealed class DshPet : Form {
             string k = d.Value;
             if (k.Length > 0 && k != _apiKey) {
                 _apiKey = k;
+                _isAccount = false;          // a manual key beats the account grant
                 SaveKey(k);
                 _pollWant = 2;
                 Log("api key set manually (length " + k.Length + ")");
@@ -3038,7 +3068,8 @@ public sealed class DshPet : Form {
 
     string FetchWithHttp() {
         HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, _apiUrl);
-        req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
+        if (_isAccount) req.Headers.TryAddWithoutValidation("x-dsh-auth-token", Secret);
+        else req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + Secret);
         req.Headers.TryAddWithoutValidation("Accept", "application/json");
         HttpResponseMessage resp = Http.SendAsync(req).GetAwaiter().GetResult();
         string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
@@ -3049,9 +3080,14 @@ public sealed class DshPet : Form {
     string FetchWithNode() {
         string node = FindNode();
         if (node == null) throw new Exception("node not found");
+        // The header name and value ride in on the environment so both credential
+        // shapes work over the Node transport too.
         string script =
             "const h=require('https');const u=process.env.DSHPET_URL;" +
-            "const r=h.get(u,{headers:{Authorization:'Bearer '+process.env.DSHPET_KEY,Accept:'application/json'}}," +
+            "const hn=process.env.DSHPET_HEADER||'Authorization';" +
+            "const hv=process.env.DSHPET_HEADERVAL||('Bearer '+process.env.DSHPET_KEY);" +
+            "const o={headers:{Accept:'application/json'}};o.headers[hn]=hv;" +
+            "const r=h.get(u,o," +
             "s=>{let b='';s.on('data',c=>b+=c);s.on('end',()=>{process.stdout.write(b)})});" +
             "r.on('error',e=>{console.error(String(e.message||e));process.exit(2)});" +
             "r.setTimeout(15000,()=>{console.error('timeout');process.exit(3)});";
@@ -3065,15 +3101,24 @@ public sealed class DshPet : Form {
         psi.RedirectStandardError = true;
         psi.EnvironmentVariables["DSHPET_URL"] = _apiUrl;
         psi.EnvironmentVariables["DSHPET_KEY"] = _apiKey;
+        psi.EnvironmentVariables["DSHPET_HEADER"] = _isAccount ? "x-dsh-auth-token" : "Authorization";
+        psi.EnvironmentVariables["DSHPET_HEADERVAL"] = _isAccount ? Secret : ("Bearer " + Secret);
         using (Process p = Process.Start(psi)) {
             string outp = p.StandardOutput.ReadToEnd();
             string errp = p.StandardError.ReadToEnd();
             if (!p.WaitForExit(20000)) { try { p.Kill(); } catch { } throw new Exception("node timeout"); }
             if (p.ExitCode != 0 || outp.Trim().Length == 0)
                 throw new Exception("node exit " + p.ExitCode + " " + Trunc(errp));
-            if (outp.IndexOf("is_available") < 0) throw new Exception("node: " + Trunc(outp));
+            if (!LooksLikeBalance(outp)) throw new Exception("node: " + Trunc(outp));
             return outp;
         }
+    }
+
+    // A 200 with an error envelope must not be mistaken for a reading, and the
+    // two credential shapes answer with different envelopes.
+    bool LooksLikeBalance(string body) {
+        if (_isAccount) return body.IndexOf("\"normal_wallets\"") >= 0 || body.IndexOf("\"bonus_wallets\"") >= 0;
+        return body.IndexOf("is_available") >= 0;
     }
 
     static string Trunc(string s) {
@@ -3093,12 +3138,12 @@ public sealed class DshPet : Form {
     // applied by OnTick, so the tablet still reacts within one frame of it
     // arriving. Only one request is ever in flight.
     void PollNow(bool snap) {
-        if (string.IsNullOrEmpty(_apiKey)) {
+        if (!HasSecret) {
             _connected = false;
             _status = S_NOKEY;
-            _lastPollResult = "no api key";
+            _lastPollResult = "no credentials";
             _dirty = true;
-            Log("poll skipped: no api key (menu: " + S_SETKEY + ")");
+            Log("poll skipped: no credentials (menu: " + S_SETKEY + ")");
             return;
         }
         if (Interlocked.CompareExchange(ref _pollInFlight, 1, 0) != 0) return;
@@ -3106,7 +3151,7 @@ public sealed class DshPet : Form {
         ThreadPool.QueueUserWorkItem(delegate {
             try {
                 string body = FetchBalance();
-                double bal = ParseCny(body);
+                double bal = ParseAnyCny(body);
                 if (double.IsNaN(bal)) { Fail("cannot parse response: " + Trunc(body)); return; }
                 lock (_hits) { _bankedBal = bal; _bankedSnap = wantSnap; _bankedValid = true; }
             } catch (Exception ex) {
@@ -3141,7 +3186,7 @@ public sealed class DshPet : Form {
     void PollNowSync(bool snap) {
         try {
             string body = FetchBalance();
-            double bal = ParseCny(body);
+            double bal = ParseAnyCny(body);
             if (double.IsNaN(bal)) { Fail("cannot parse response: " + Trunc(body)); return; }
             ApplyBalance(bal, snap);
         } catch (Exception ex) { Fail(ex.Message); }
@@ -3287,6 +3332,56 @@ public sealed class DshPet : Form {
         if (double.TryParse(scope.Substring(q1 + 1, q2 - q1 - 1), NumberStyles.Float,
                             CultureInfo.InvariantCulture, out v)) return v;
         return double.NaN;
+    }
+
+    // Picks the parser that matches the credential in use.
+    double ParseAnyCny(string json) {
+        return _isAccount ? ParseAccountCny(json) : ParseCny(json);
+    }
+
+    // The DSH account endpoint answers with
+    //   data.biz_data.{normal_wallets,bonus_wallets}[].{currency,balance}
+    // and no total, so the CNY wallets are added up here. "0E-16" is a valid
+    // double and parses as zero, which is exactly the empty normal wallet.
+    static double ParseAccountCny(string json) {
+        double total = 0;
+        bool any = false;
+        foreach (string array in new string[] { "\"normal_wallets\"", "\"bonus_wallets\"" }) {
+            int a = json.IndexOf(array);
+            if (a < 0) continue;
+            int lb = json.IndexOf('[', a);
+            if (lb < 0) continue;
+            int rb = json.IndexOf(']', lb);
+            if (rb < 0) rb = json.Length;
+            string span = json.Substring(lb + 1, rb - lb - 1);
+            int cursor = 0;
+            while (cursor < span.Length) {
+                int ci = span.IndexOf("\"currency\"", cursor);
+                if (ci < 0) break;
+                int ciColon = span.IndexOf(':', ci);
+                string currency = JsonStringAfter(span, ciColon);
+                int bi = span.IndexOf("\"balance\"", ci);
+                if (bi < 0) break;
+                string balance = JsonStringAfter(span, span.IndexOf(':', bi));
+                double v;
+                if (currency == "CNY" && balance != null && double.TryParse(balance, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out v)) {
+                    total += v;
+                    any = true;
+                }
+                cursor = bi + 1;
+            }
+        }
+        return any ? total : double.NaN;
+    }
+
+    static string JsonStringAfter(string s, int colon) {
+        if (colon < 0) return null;
+        int q1 = s.IndexOf('"', colon + 1);
+        if (q1 < 0) return null;
+        int q2 = s.IndexOf('"', q1 + 1);
+        if (q2 < 0) return null;
+        return s.Substring(q1 + 1, q2 - q1 - 1);
     }
 
     void Log(string msg) {
@@ -5028,17 +5123,46 @@ public sealed class DshPet : Form {
 $here = $PSScriptRoot
 if (-not $here) { $here = (Get-Location).Path }
 
-# API key: local override, then environment, then DSH's own credential store.
+# Credentials: local override, then environment, then DSH's own credential store.
+# Two shapes are supported:
+#   * an sk- API Key   -> https://api.deepseek.com/user/balance  (Authorization: Bearer)
+#   * a DSH account grant (deepseek-account-platform/default)
+#                      -> <issuer>/api/v0/users/get_user_summary  (x-dsh-auth-token)
+# The account grant is what a plain DSH install has: no sk- key required.
 $keyFile = Join-Path $here 'apikey.txt'
 if (-not $env:DSHPET_KEY -and (Test-Path $keyFile)) {
     $k = (Get-Content $keyFile -Raw).Trim()
     if ($k) { $env:DSHPET_KEY = $k }
 }
-if (-not $env:DSHPET_KEY) {
+if (-not $env:DSHPET_KEY -and -not $env:DSHPET_TOKEN) {
     $cred = Join-Path $env:USERPROFILE '.dsh\.credentials.yaml'
     if (Test-Path $cred) {
-        $m = [regex]::Match((Get-Content $cred -Raw), 'DEEPSEEK_API_KEY:\s*(\S+)')
-        if ($m.Success) { $env:DSHPET_KEY = $m.Groups[1].Value }
+        $raw = Get-Content $cred -Raw
+        $m = [regex]::Match($raw, 'DEEPSEEK_API_KEY:\s*(\S+)')
+        if ($m.Success) {
+            $env:DSHPET_KEY = $m.Groups[1].Value
+        } else {
+            $token = $null
+            $issuer = $null
+            $inRecord = $false
+            foreach ($line in ($raw -split "`r?`n")) {
+                if ($line -match '^\s{2}deepseek-account-platform/default:\s*$') { $inRecord = $true; continue }
+                if ($inRecord) {
+                    if ($line -match '^\s{2}\S') { break }
+                    $mt = [regex]::Match($line, '^\s+token:\s*(\S+)\s*$')
+                    if ($mt.Success) { $token = $mt.Groups[1].Value }
+                    $mi = [regex]::Match($line, '^\s+issuer:\s*(\S+)\s*$')
+                    if ($mi.Success) { $issuer = $mi.Groups[1].Value }
+                }
+            }
+            # Only an HTTPS issuer is accepted, and never one carrying a query,
+            # credentials or a path fragment we did not expect.
+            if ($token -and $issuer -match '^https://[A-Za-z0-9\.\-]+(:[0-9]+)?/?$') {
+                $env:DSHPET_AUTH = 'account'
+                $env:DSHPET_TOKEN = $token
+                $env:DSHPET_API = ($issuer.TrimEnd('/') + '/api/v0/users/get_user_summary')
+            }
+        }
     }
 }
 if (-not $env:DSHPET_SPRITE) { $env:DSHPET_SPRITE = Join-Path $here 'sprite.png' }
